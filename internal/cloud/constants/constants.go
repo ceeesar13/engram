@@ -6,6 +6,7 @@ const (
 	TargetKeyCloud = store.DefaultSyncTargetKey
 
 	ReasonBlockedUnenrolled           = "blocked_unenrolled"
+	ReasonBlockedNoRoute              = "blocked_no_route"
 	ReasonNonEnrolledPendingMutations = "non_enrolled_pending_mutations"
 	ReasonPaused                      = "paused"
 	ReasonAuthRequired                = "auth_required"
@@ -40,6 +41,7 @@ const (
 
 var DeterministicReasons = []string{
 	ReasonBlockedUnenrolled,
+	ReasonBlockedNoRoute,
 	ReasonNonEnrolledPendingMutations,
 	ReasonPaused,
 	ReasonAuthRequired,

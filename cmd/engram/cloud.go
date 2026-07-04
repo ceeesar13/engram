@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -144,19 +145,175 @@ var runUpgradeBootstrap = func(s *store.Store, project string, cc *cloudConfig) 
 }
 
 type cloudConfig struct {
+	// Legacy single-destination fields (v1). Retained so existing installs and
+	// `engram cloud config --server` keep working; migrated into a `default`
+	// remote at runtime.
+	ServerURL string `json:"server_url,omitempty"`
+	Token     string `json:"token,omitempty"`
+
+	// v2: named cloud destinations and the per-project routing table.
+	Remotes       map[string]remoteConfig `json:"remotes,omitempty"`
+	Routes        map[string]string       `json:"routes,omitempty"`
+	DefaultRemote string                  `json:"default_remote,omitempty"`
+}
+
+// remoteConfig is a single named cloud destination (server URL + bearer token).
+type remoteConfig struct {
 	ServerURL string `json:"server_url"`
-	Token     string `json:"token"`
+	Token     string `json:"token,omitempty"`
+}
+
+const legacyDefaultRemoteName = "default"
+
+// clone returns a deep copy safe to mutate without touching the receiver.
+func (cc *cloudConfig) clone() *cloudConfig {
+	out := &cloudConfig{
+		ServerURL:     cc.ServerURL,
+		Token:         cc.Token,
+		DefaultRemote: cc.DefaultRemote,
+	}
+	if cc.Remotes != nil {
+		out.Remotes = make(map[string]remoteConfig, len(cc.Remotes))
+		for k, v := range cc.Remotes {
+			out.Remotes[k] = v
+		}
+	}
+	if cc.Routes != nil {
+		out.Routes = make(map[string]string, len(cc.Routes))
+		for k, v := range cc.Routes {
+			out.Routes[k] = v
+		}
+	}
+	return out
+}
+
+// migrateLegacy folds v1 top-level server_url/token into a `default` remote so
+// existing single-cloud installs keep their previous behavior with no action.
+func (cc *cloudConfig) migrateLegacy() {
+	if strings.TrimSpace(cc.ServerURL) == "" && strings.TrimSpace(cc.Token) == "" {
+		return
+	}
+	if cc.Remotes == nil {
+		cc.Remotes = map[string]remoteConfig{}
+	}
+	if _, exists := cc.Remotes[legacyDefaultRemoteName]; !exists {
+		cc.Remotes[legacyDefaultRemoteName] = remoteConfig{
+			ServerURL: strings.TrimSpace(cc.ServerURL),
+			Token:     strings.TrimSpace(cc.Token),
+		}
+	}
+	if strings.TrimSpace(cc.DefaultRemote) == "" {
+		cc.DefaultRemote = legacyDefaultRemoteName
+	}
+	cc.ServerURL = ""
+	cc.Token = ""
+}
+
+// applyEnvOverrides folds ENGRAM_CLOUD_SERVER / ENGRAM_CLOUD_TOKEN into the
+// default remote, preserving the historical env-only escape hatch. It operates
+// on a runtime clone and never persists env-provided secrets to disk.
+//
+// Security: this must never defeat per-project default-deny. If remotes/routes
+// are configured but DefaultRemote is intentionally empty (strict-deny), env
+// vars must NOT manufacture a default — that would let an unrouted project
+// silently sync to the env-provided server instead of being denied. Env
+// overrides only ever (a) fold into an already-configured default remote, or
+// (b) create the `default` remote when there are no remotes at all (pure
+// legacy / env-only setups, preserving issues #343/#421).
+func (cc *cloudConfig) applyEnvOverrides() {
+	srv := strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_SERVER"))
+	tok := strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_TOKEN"))
+	if srv == "" && tok == "" {
+		return
+	}
+	name := strings.TrimSpace(cc.DefaultRemote)
+	if name == "" {
+		if len(cc.Remotes) > 0 {
+			// Strict-deny config: remotes exist but no default was chosen.
+			// Do not manufacture one from env — that would bypass default-deny.
+			return
+		}
+		name = legacyDefaultRemoteName
+	}
+	if cc.Remotes == nil {
+		cc.Remotes = map[string]remoteConfig{}
+	}
+	rc := cc.Remotes[name]
+	if srv != "" {
+		rc.ServerURL = srv
+	}
+	if tok != "" {
+		rc.Token = tok
+	}
+	cc.Remotes[name] = rc
+	if strings.TrimSpace(cc.DefaultRemote) == "" {
+		cc.DefaultRemote = name
+	}
+}
+
+// normalizedForRuntime returns a runtime view (v2 shape, env overrides applied)
+// safe to read for destination resolution. The result MUST NOT be persisted.
+func (cc *cloudConfig) normalizedForRuntime() *cloudConfig {
+	rt := cc.clone()
+	rt.migrateLegacy()
+	rt.applyEnvOverrides()
+	return rt
+}
+
+// routeRemote returns the remote name a project resolves to: its explicit route
+// if set, otherwise the configured default remote. Empty means no route applies.
+func (cc *cloudConfig) routeRemote(project string) string {
+	project, _ = store.NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project != "" && cc.Routes != nil {
+		if name, ok := cc.Routes[project]; ok && strings.TrimSpace(name) != "" {
+			return strings.TrimSpace(name)
+		}
+	}
+	return strings.TrimSpace(cc.DefaultRemote)
+}
+
+// resolveForProject returns the effective destination for a project applying
+// per-project routing with default-deny. On error, reason is a deterministic
+// reason code (blocked_no_route or cloud_config_error).
+func (cc *cloudConfig) resolveForProject(project string) (effective cloudConfig, remoteName, reason string, err error) {
+	remoteName = cc.routeRemote(project)
+	proj := strings.TrimSpace(project)
+	if remoteName == "" {
+		if len(cc.Remotes) == 0 {
+			// Cloud was never configured — preserve the historical
+			// missing-server error rather than reporting a routing denial.
+			return cloudConfig{}, "", constants.ReasonCloudConfigError, fmt.Errorf(
+				"cloud server is missing: configure server URL with `engram cloud config --server <url>` or add a remote with `engram cloud remote add <name> --server <url>`",
+			)
+		}
+		if proj == "" {
+			return cloudConfig{}, "", constants.ReasonBlockedNoRoute, fmt.Errorf("no project specified for cloud sync")
+		}
+		return cloudConfig{}, "", constants.ReasonBlockedNoRoute, fmt.Errorf(
+			"project %q has no cloud route; assign one with `engram cloud route set --project %s --remote <name>` or set a default with `engram cloud remote set-default <name>`",
+			proj, proj,
+		)
+	}
+	rc, ok := cc.Remotes[remoteName]
+	if !ok {
+		return cloudConfig{}, remoteName, constants.ReasonCloudConfigError, fmt.Errorf(
+			"cloud route for project %q points to unknown remote %q; add it with `engram cloud remote add %s --server <url>`",
+			proj, remoteName, remoteName,
+		)
+	}
+	return cloudConfig{ServerURL: rc.ServerURL, Token: rc.Token}, remoteName, "", nil
 }
 
 func cmdCloud(cfg store.Config) {
 	if len(os.Args) < 3 {
 		fmt.Fprintln(os.Stderr, "usage: engram cloud <subcommand> [options]")
-		fmt.Fprintln(os.Stderr, "supported subcommands: status, enroll, config, serve, upgrade, repair")
+		fmt.Fprintln(os.Stderr, "supported subcommands: status, enroll, config, remote, route, serve, upgrade, repair")
 		exitFunc(1)
 	}
 	if os.Args[2] == "--help" || os.Args[2] == "-h" || os.Args[2] == "help" {
 		fmt.Println("usage: engram cloud <subcommand> [options]")
-		fmt.Println("supported subcommands: status, enroll, config, serve, upgrade, repair")
+		fmt.Println("supported subcommands: status, enroll, config, remote, route, serve, upgrade, repair")
 		return
 	}
 
@@ -167,6 +324,10 @@ func cmdCloud(cfg store.Config) {
 		cmdCloudEnroll(cfg)
 	case "config":
 		cmdCloudConfig(cfg)
+	case "remote":
+		cmdCloudRemote(cfg)
+	case "route":
+		cmdCloudRoute(cfg)
 	case "serve":
 		cmdCloudServe()
 	case "upgrade":
@@ -175,7 +336,7 @@ func cmdCloud(cfg store.Config) {
 		cmdCloudRepair()
 	default:
 		fmt.Fprintf(os.Stderr, "unknown cloud command: %s\n", os.Args[2])
-		fmt.Fprintln(os.Stderr, "supported subcommands: status, enroll, config, serve, upgrade, repair")
+		fmt.Fprintln(os.Stderr, "supported subcommands: status, enroll, config, remote, route, serve, upgrade, repair")
 		exitFunc(1)
 	}
 }
@@ -277,7 +438,7 @@ func cmdCloudUpgradeDoctor(cfg store.Config) {
 	defer s.Close()
 
 	cloudConfigured := false
-	if cc, cfgErr := resolveCloudRuntimeConfig(cfg); cfgErr == nil {
+	if cc, _, _, cfgErr := resolveRoutedCloudConfig(cfg, project); cfgErr == nil {
 		if cc != nil {
 			if validated, err := validateCloudServerURL(cc.ServerURL); err == nil && strings.TrimSpace(validated) != "" {
 				cloudConfigured = true
@@ -423,7 +584,7 @@ func cmdCloudUpgradeBootstrap(cfg store.Config) {
 	}
 	defer s.Close()
 
-	cc, err := resolveCloudRuntimeConfig(cfg)
+	cc, _, _, err := resolveRoutedCloudConfig(cfg, project)
 	if err != nil {
 		fatal(err)
 		return
@@ -571,7 +732,7 @@ func cmdCloudUpgradeRollback(cfg store.Config) {
 		return
 	}
 	if state.Snapshot.CloudConfigPresent {
-		if err := os.WriteFile(cloudConfigPath(cfg), []byte(state.Snapshot.CloudConfigJSON), 0o644); err != nil {
+		if err := os.WriteFile(cloudConfigPath(cfg), []byte(state.Snapshot.CloudConfigJSON), 0o600); err != nil {
 			fatal(err)
 			return
 		}
@@ -703,22 +864,380 @@ func cmdCloudConfig(cfg store.Config) {
 		fmt.Fprintln(os.Stderr, "usage: engram cloud config --server <url>")
 		exitFunc(1)
 	}
-	cc := &cloudConfig{ServerURL: strings.TrimSpace(os.Args[4])}
-	if cc.ServerURL == "" {
+	serverURL := strings.TrimSpace(os.Args[4])
+	if serverURL == "" {
 		fmt.Fprintln(os.Stderr, "error: server URL is required")
 		exitFunc(1)
 	}
-	validatedURL, err := validateCloudServerURL(cc.ServerURL)
+	validatedURL, err := validateCloudServerURL(serverURL)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: invalid server URL: %v\n", err)
 		exitFunc(1)
 	}
+	// Preserve any configured v2 remotes/routes; only update the legacy
+	// single-destination server URL (migrated into the default remote at runtime).
+	cc, err := loadCloudConfig(cfg)
+	if err != nil {
+		fatal(err)
+		return
+	}
+	if cc == nil {
+		cc = &cloudConfig{}
+	}
 	cc.ServerURL = validatedURL
+	// v2: once a `default` remote already exists, migrateLegacy's `if !exists`
+	// guard means the legacy ServerURL field above is otherwise ignored at
+	// runtime. Keep `cloud config --server` working post-migration by also
+	// updating the active default remote's ServerURL (preserving its token).
+	//
+	// Security: if remotes are configured but no default is set (strict
+	// default-deny: named remotes + routes, no default), we must NOT
+	// manufacture a `default` remote here — that would silently give an
+	// otherwise-denied unrouted project a destination to sync to. Refuse
+	// instead and point the operator at the explicit remote/route commands.
+	if len(cc.Remotes) > 0 {
+		name := strings.TrimSpace(cc.DefaultRemote)
+		if name == "" {
+			fmt.Fprintln(os.Stderr, "error: named remotes are configured without a default remote; `cloud config --server` cannot pick a target without disabling default-deny. Use `engram cloud remote add <name> --server <url>`, `engram cloud remote set-default <name>`, or `engram cloud route set --project <p> --remote <name>`.")
+			exitFunc(1)
+			return
+		}
+		rc := cc.Remotes[name]
+		rc.ServerURL = validatedURL
+		cc.Remotes[name] = rc
+	}
 	if err := saveCloudConfig(cfg, cc); err != nil {
 		fatal(err)
 		return
 	}
 	fmt.Printf("✓ Cloud server set to %s\n", cc.ServerURL)
+}
+
+// loadCloudConfigForWrite loads cloud.json for mutation, folding any legacy
+// single-destination fields into the `default` remote so config commands
+// converge the file on the v2 shape without dropping the existing destination.
+func loadCloudConfigForWrite(cfg store.Config) *cloudConfig {
+	cc, err := loadCloudConfig(cfg)
+	if err != nil {
+		fatal(err)
+		return &cloudConfig{}
+	}
+	if cc == nil {
+		cc = &cloudConfig{}
+	}
+	cc.migrateLegacy()
+	return cc
+}
+
+// parseCloudFlags parses a flat list of `--key value` pairs. Malformed input
+// returns an error naming the offending token.
+func parseCloudFlags(args []string) (map[string]string, error) {
+	out := map[string]string{}
+	for i := 0; i < len(args); i++ {
+		key := args[i]
+		if !strings.HasPrefix(key, "--") {
+			return nil, fmt.Errorf("unexpected argument %q", key)
+		}
+		if i+1 >= len(args) {
+			return nil, fmt.Errorf("flag %q requires a value", key)
+		}
+		out[strings.TrimPrefix(key, "--")] = strings.TrimSpace(args[i+1])
+		i++
+	}
+	return out, nil
+}
+
+func cloudRemoteUsage() {
+	fmt.Fprintln(os.Stderr, "usage: engram cloud remote <add|list|remove|set-default> [options]")
+	fmt.Fprintln(os.Stderr, "  add <name> --server <url> [--token <token>]")
+	fmt.Fprintln(os.Stderr, "  list")
+	fmt.Fprintln(os.Stderr, "  remove <name>")
+	fmt.Fprintln(os.Stderr, "  set-default <name>")
+}
+
+func cmdCloudRemote(cfg store.Config) {
+	if len(os.Args) < 4 {
+		cloudRemoteUsage()
+		exitFunc(1)
+		return
+	}
+	switch os.Args[3] {
+	case "add":
+		cmdCloudRemoteAdd(cfg)
+	case "list", "ls":
+		cmdCloudRemoteList(cfg)
+	case "remove", "rm":
+		cmdCloudRemoteRemove(cfg)
+	case "set-default":
+		cmdCloudRemoteSetDefault(cfg)
+	case "--help", "-h", "help":
+		cloudRemoteUsage()
+	default:
+		fmt.Fprintf(os.Stderr, "unknown cloud remote command: %s\n", os.Args[3])
+		cloudRemoteUsage()
+		exitFunc(1)
+	}
+}
+
+func cmdCloudRemoteAdd(cfg store.Config) {
+	if len(os.Args) < 5 {
+		fmt.Fprintln(os.Stderr, "usage: engram cloud remote add <name> --server <url> [--token <token>]")
+		exitFunc(1)
+		return
+	}
+	name := strings.TrimSpace(os.Args[4])
+	if name == "" || strings.HasPrefix(name, "--") {
+		fmt.Fprintln(os.Stderr, "error: remote name is required")
+		exitFunc(1)
+		return
+	}
+	flags, err := parseCloudFlags(os.Args[5:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		exitFunc(1)
+		return
+	}
+	server := flags["server"]
+	if server == "" {
+		fmt.Fprintln(os.Stderr, "error: --server <url> is required")
+		exitFunc(1)
+		return
+	}
+	validatedURL, err := validateCloudServerURL(server)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: invalid server URL: %v\n", err)
+		exitFunc(1)
+		return
+	}
+	cc := loadCloudConfigForWrite(cfg)
+	if cc.Remotes == nil {
+		cc.Remotes = map[string]remoteConfig{}
+	}
+	cc.Remotes[name] = remoteConfig{ServerURL: validatedURL, Token: strings.TrimSpace(flags["token"])}
+	if err := saveCloudConfig(cfg, cc); err != nil {
+		fatal(err)
+		return
+	}
+	fmt.Printf("✓ Cloud remote %q set to %s\n", name, validatedURL)
+	if strings.TrimSpace(cc.DefaultRemote) == "" {
+		fmt.Printf("  note: no default remote set; route projects with `engram cloud route set` or run `engram cloud remote set-default %s`\n", name)
+	}
+}
+
+func cmdCloudRemoteList(cfg store.Config) {
+	cc := loadCloudConfigForWrite(cfg)
+	if len(cc.Remotes) == 0 {
+		fmt.Println("No cloud remotes configured.")
+		fmt.Println("Add one with `engram cloud remote add <name> --server <url> [--token <token>]`")
+		return
+	}
+	names := make([]string, 0, len(cc.Remotes))
+	for name := range cc.Remotes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	fmt.Println("Cloud remotes:")
+	for _, name := range names {
+		rc := cc.Remotes[name]
+		marker := " "
+		if name == strings.TrimSpace(cc.DefaultRemote) {
+			marker = "*"
+		}
+		tokenState := "no token"
+		if strings.TrimSpace(rc.Token) != "" {
+			tokenState = "token set"
+		}
+		fmt.Printf("  %s %-16s %s (%s)\n", marker, name, rc.ServerURL, tokenState)
+	}
+	if strings.TrimSpace(cc.DefaultRemote) != "" {
+		fmt.Printf("Default remote: %s\n", cc.DefaultRemote)
+	} else {
+		fmt.Println("Default remote: (none — projects without an explicit route will not sync)")
+	}
+}
+
+func cmdCloudRemoteRemove(cfg store.Config) {
+	if len(os.Args) < 5 {
+		fmt.Fprintln(os.Stderr, "usage: engram cloud remote remove <name>")
+		exitFunc(1)
+		return
+	}
+	name := strings.TrimSpace(os.Args[4])
+	cc := loadCloudConfigForWrite(cfg)
+	if _, ok := cc.Remotes[name]; !ok {
+		fmt.Fprintf(os.Stderr, "error: remote %q does not exist\n", name)
+		exitFunc(1)
+		return
+	}
+	var orphaned []string
+	for project, remoteName := range cc.Routes {
+		if remoteName == name {
+			orphaned = append(orphaned, project)
+		}
+	}
+	if len(orphaned) > 0 {
+		sort.Strings(orphaned)
+		fmt.Fprintf(os.Stderr, "error: remote %q is still routed by project(s): %s\n", name, strings.Join(orphaned, ", "))
+		fmt.Fprintln(os.Stderr, "unset those routes first with `engram cloud route unset --project <name>`")
+		exitFunc(1)
+		return
+	}
+	delete(cc.Remotes, name)
+	if strings.TrimSpace(cc.DefaultRemote) == name {
+		cc.DefaultRemote = ""
+	}
+	if err := saveCloudConfig(cfg, cc); err != nil {
+		fatal(err)
+		return
+	}
+	fmt.Printf("✓ Cloud remote %q removed\n", name)
+}
+
+func cmdCloudRemoteSetDefault(cfg store.Config) {
+	if len(os.Args) < 5 {
+		fmt.Fprintln(os.Stderr, "usage: engram cloud remote set-default <name>")
+		exitFunc(1)
+		return
+	}
+	name := strings.TrimSpace(os.Args[4])
+	cc := loadCloudConfigForWrite(cfg)
+	if name != "" {
+		if _, ok := cc.Remotes[name]; !ok {
+			fmt.Fprintf(os.Stderr, "error: remote %q does not exist; add it first with `engram cloud remote add`\n", name)
+			exitFunc(1)
+			return
+		}
+	}
+	cc.DefaultRemote = name
+	if err := saveCloudConfig(cfg, cc); err != nil {
+		fatal(err)
+		return
+	}
+	if name == "" {
+		fmt.Println("✓ Default remote cleared (projects without an explicit route will not sync)")
+	} else {
+		fmt.Printf("✓ Default remote set to %q\n", name)
+	}
+}
+
+func cloudRouteUsage() {
+	fmt.Fprintln(os.Stderr, "usage: engram cloud route <set|list|unset> [options]")
+	fmt.Fprintln(os.Stderr, "  set --project <project> --remote <name>")
+	fmt.Fprintln(os.Stderr, "  list")
+	fmt.Fprintln(os.Stderr, "  unset --project <project>")
+}
+
+func cmdCloudRoute(cfg store.Config) {
+	if len(os.Args) < 4 {
+		cloudRouteUsage()
+		exitFunc(1)
+		return
+	}
+	switch os.Args[3] {
+	case "set":
+		cmdCloudRouteSet(cfg)
+	case "list", "ls":
+		cmdCloudRouteList(cfg)
+	case "unset", "remove", "rm":
+		cmdCloudRouteUnset(cfg)
+	case "--help", "-h", "help":
+		cloudRouteUsage()
+	default:
+		fmt.Fprintf(os.Stderr, "unknown cloud route command: %s\n", os.Args[3])
+		cloudRouteUsage()
+		exitFunc(1)
+	}
+}
+
+func cmdCloudRouteSet(cfg store.Config) {
+	flags, err := parseCloudFlags(os.Args[4:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		exitFunc(1)
+		return
+	}
+	project, _ := store.NormalizeProject(flags["project"])
+	project = strings.TrimSpace(project)
+	remoteName := strings.TrimSpace(flags["remote"])
+	if project == "" || remoteName == "" {
+		fmt.Fprintln(os.Stderr, "usage: engram cloud route set --project <project> --remote <name>")
+		exitFunc(1)
+		return
+	}
+	cc := loadCloudConfigForWrite(cfg)
+	if _, ok := cc.Remotes[remoteName]; !ok {
+		fmt.Fprintf(os.Stderr, "error: remote %q does not exist; add it first with `engram cloud remote add %s --server <url>`\n", remoteName, remoteName)
+		exitFunc(1)
+		return
+	}
+	if cc.Routes == nil {
+		cc.Routes = map[string]string{}
+	}
+	cc.Routes[project] = remoteName
+	if err := saveCloudConfig(cfg, cc); err != nil {
+		fatal(err)
+		return
+	}
+	fmt.Printf("✓ Project %q routed to remote %q\n", project, remoteName)
+}
+
+func cmdCloudRouteList(cfg store.Config) {
+	cc := loadCloudConfigForWrite(cfg)
+	if len(cc.Routes) == 0 {
+		fmt.Println("No project routes configured.")
+		if strings.TrimSpace(cc.DefaultRemote) != "" {
+			fmt.Printf("Default remote (fallback for unrouted projects): %s\n", cc.DefaultRemote)
+		} else {
+			fmt.Println("No default remote: projects without a route will not sync (default-deny).")
+		}
+		return
+	}
+	projects := make([]string, 0, len(cc.Routes))
+	for project := range cc.Routes {
+		projects = append(projects, project)
+	}
+	sort.Strings(projects)
+	fmt.Println("Project routes:")
+	for _, project := range projects {
+		remoteName := cc.Routes[project]
+		state := ""
+		if _, ok := cc.Remotes[remoteName]; !ok {
+			state = "  [!] unknown remote"
+		}
+		fmt.Printf("  %-20s -> %s%s\n", project, remoteName, state)
+	}
+	if strings.TrimSpace(cc.DefaultRemote) != "" {
+		fmt.Printf("Default remote (fallback for unrouted projects): %s\n", cc.DefaultRemote)
+	} else {
+		fmt.Println("No default remote: projects without a route will not sync (default-deny).")
+	}
+}
+
+func cmdCloudRouteUnset(cfg store.Config) {
+	flags, err := parseCloudFlags(os.Args[4:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		exitFunc(1)
+		return
+	}
+	project, _ := store.NormalizeProject(flags["project"])
+	project = strings.TrimSpace(project)
+	if project == "" {
+		fmt.Fprintln(os.Stderr, "usage: engram cloud route unset --project <project>")
+		exitFunc(1)
+		return
+	}
+	cc := loadCloudConfigForWrite(cfg)
+	if _, ok := cc.Routes[project]; !ok {
+		fmt.Printf("Project %q has no route.\n", project)
+		return
+	}
+	delete(cc.Routes, project)
+	if err := saveCloudConfig(cfg, cc); err != nil {
+		fatal(err)
+		return
+	}
+	fmt.Printf("✓ Route for project %q removed\n", project)
 }
 
 func validateCloudServerURL(raw string) (string, error) {
@@ -842,5 +1361,5 @@ func saveCloudConfig(cfg store.Config, cc *cloudConfig) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(cloudConfigPath(cfg), b, 0o644)
+	return os.WriteFile(cloudConfigPath(cfg), b, 0o600)
 }

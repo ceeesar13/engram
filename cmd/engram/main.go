@@ -346,9 +346,27 @@ func (p storeSyncStatusProvider) upgradeStatus(project string) (string, string, 
 }
 
 func (p storeSyncStatusProvider) cloudSyncEnabled(project string) (bool, string, string) {
-	cc, err := resolveCloudRuntimeConfig(p.cfg)
+	// Routing-aware resolution (C1a): use the project's actual route instead of
+	// the project-blind default remote, so status reflects blocked_no_route for
+	// an unrouted project rather than silently reporting the default remote.
+	cc, remoteName, reason, err := resolveRoutedCloudConfig(p.cfg, project)
 	if err != nil {
-		return false, "cloud_config_error", fmt.Sprintf("cloud config error: %v", err)
+		switch reason {
+		case constants.ReasonBlockedNoRoute:
+			return false, constants.ReasonBlockedNoRoute, err.Error()
+		case constants.ReasonCloudConfigError:
+			if strings.TrimSpace(remoteName) != "" {
+				// The route resolved to a specific remote name that isn't
+				// configured (e.g. a route or default pointing at a
+				// since-removed remote) — surface the resolver's actual
+				// diagnostic instead of collapsing it into the generic
+				// "not configured" message, which would hide the real cause.
+				return false, constants.ReasonCloudConfigError, err.Error()
+			}
+			return false, "cloud_not_configured", "cloud sync is not configured"
+		default:
+			return false, "cloud_config_error", fmt.Sprintf("cloud config error: %v", err)
+		}
 	}
 	if cc == nil || strings.TrimSpace(cc.ServerURL) == "" {
 		return false, "cloud_not_configured", "cloud sync is not configured"
@@ -445,24 +463,48 @@ func envBool(key string) bool {
 }
 
 func resolveCloudRuntimeConfig(cfg store.Config) (*cloudConfig, error) {
-	cc, err := loadCloudConfig(cfg)
+	raw, err := loadCloudConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("read cloud config: %w", err)
 	}
-	if cc == nil {
-		cc = &cloudConfig{}
+	if raw == nil {
+		raw = &cloudConfig{}
 	}
-	// ENGRAM_CLOUD_TOKEN overrides any token stored in cloud.json.
-	// When the env var is absent, the persisted token from cloud.json is used
-	// as a fallback so that `engram sync --cloud` works without requiring the
-	// env var to be set in every shell session (fix for issue #343).
-	if v := strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_SERVER")); v != "" {
-		cc.ServerURL = v
+	// Normalize to the v2 shape and fold ENGRAM_CLOUD_SERVER / ENGRAM_CLOUD_TOKEN
+	// into the default remote. The default remote is then exposed as the flat
+	// ServerURL/Token pair used by autosync, status, and upgrade flows — which
+	// preserves the historical single-destination behavior, including the
+	// cloud.json token fallback when the env var is absent (issues #343/#421).
+	rt := raw.normalizedForRuntime()
+	eff := &cloudConfig{}
+	if name := strings.TrimSpace(rt.DefaultRemote); name != "" {
+		if r, ok := rt.Remotes[name]; ok {
+			eff.ServerURL = r.ServerURL
+			eff.Token = r.Token
+		}
 	}
-	if v := strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_TOKEN")); v != "" {
-		cc.Token = v
+	return eff, nil
+}
+
+// resolveRoutedCloudConfig is the project-aware counterpart of
+// resolveCloudRuntimeConfig: it resolves the effective cloud destination for a
+// specific project by applying per-project routing with default-deny (see
+// cloudConfig.resolveForProject). Callers that have a project in hand (status,
+// upgrade bootstrap, upgrade doctor) should use this instead of the
+// project-blind resolveCloudRuntimeConfig, which only ever returns the default
+// remote and can silently push a project to the wrong destination — or to the
+// default remote when the project should be denied.
+func resolveRoutedCloudConfig(cfg store.Config, project string) (*cloudConfig, string, string, error) {
+	raw, err := loadCloudConfig(cfg)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("read cloud config: %w", err)
 	}
-	return cc, nil
+	if raw == nil {
+		raw = &cloudConfig{}
+	}
+	rt := raw.normalizedForRuntime()
+	eff, remoteName, reason, err := rt.resolveForProject(project)
+	return &eff, remoteName, reason, err
 }
 
 func preflightCloudSync(s *store.Store, cfg store.Config, project string, mutateState bool) (*cloudConfig, error) {
@@ -472,10 +514,24 @@ func preflightCloudSync(s *store.Store, cfg store.Config, project string, mutate
 	}
 	targetKey := cloudTargetKeyForProject(project)
 
-	cc, err := resolveCloudRuntimeConfig(cfg)
-	if err != nil {
+	// Surface malformed cloud.json directly, matching the historical contract
+	// (no reason-code state mutation for a parse failure), before delegating
+	// resolution to the shared routing-aware helper.
+	if _, err := loadCloudConfig(cfg); err != nil {
 		return nil, fmt.Errorf("cloud sync config error: %w", err)
 	}
+
+	// Resolve the destination by per-project route with default-deny: an
+	// unrouted project (with remotes configured but no default) never leaves
+	// the machine. A wholly unconfigured cloud yields cloud_config_error.
+	resolved, _, reason, resolveErr := resolveRoutedCloudConfig(cfg, project)
+	if resolveErr != nil {
+		if mutateState {
+			_ = s.MarkSyncBlocked(targetKey, reason, resolveErr.Error())
+		}
+		return nil, fmt.Errorf("cloud sync %s: %s", reason, resolveErr.Error())
+	}
+	cc := resolved
 	hasServer := strings.TrimSpace(cc.ServerURL) != ""
 	if !hasServer {
 		message := "cloud server is missing: configure server URL with `engram cloud config --server <url>`"
@@ -797,6 +853,12 @@ func resolveServeSyncStatusProject() string {
 // Never fatal — autosync is optional.
 // BW7: Returns (status provider, stop func) so the caller can invoke stop
 // before os.Exit to ensure the Manager releases its sync lease.
+//
+// Start-time-only gate: the per-project routing check (autosyncRoutingBlocked)
+// below is evaluated once here, at daemon startup. Autosync does not re-poll
+// cloud.json while running, so changing routes/remotes on a running `engram
+// serve`/MCP daemon has no effect until the process is restarted. Runtime
+// re-evaluation of the routing gate is a deliberate follow-up, not handled here.
 func tryStartAutosync(ctx context.Context, s *store.Store, cfg store.Config) (autosyncStatusProvider, func()) {
 	// REQ-210: opt-in requires exact "1".
 	if strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_AUTOSYNC")) != "1" {
@@ -826,6 +888,21 @@ func tryStartAutosync(ctx context.Context, s *store.Store, cfg store.Config) (au
 		return nil, nil
 	}
 
+	// C1b safe gate: the autosync Manager pushes ALL pending mutations for ALL
+	// enrolled projects through a single transport (the default remote) — it
+	// has no concept of per-project routing. If any enrolled project is routed
+	// to a different remote, starting autosync here would silently push that
+	// project's mutations to the wrong (default) destination. Refuse to start
+	// rather than leak data across remotes; explicit `engram sync --cloud
+	// --project <name>` still respects routing.
+	if blocked, err := autosyncRoutingBlocked(cfg, s); err != nil {
+		log.Printf("[autosync] ERROR: cannot evaluate per-project cloud routing: %v; autosync disabled", err)
+		return nil, nil
+	} else if blocked {
+		log.Printf("[autosync] disabled: per-project cloud routing is configured; use `engram sync --cloud --project <name>` (per-remote autosync is not yet supported)")
+		return nil, nil
+	}
+
 	remoteMT, err := remote.NewMutationTransport(serverURL, token)
 	if err != nil {
 		log.Printf("[autosync] ERROR: invalid server URL %q: %v; autosync disabled", serverURL, err)
@@ -840,6 +917,41 @@ func tryStartAutosync(ctx context.Context, s *store.Store, cfg store.Config) (au
 	go mgr.Run(ctx)
 	log.Printf("[autosync] started (server=%s)", serverURL)
 	return mgr, mgr.Stop
+}
+
+// autosyncRoutingBlocked reports whether the single-transport autosync Manager
+// cannot safely serve every enrolled project: true when at least one enrolled
+// project is routed (explicitly, via `engram cloud route set`) to a remote
+// other than the configured default. The autosync.Manager has no per-project
+// remote allowlist, so starting it in that situation would push the
+// other-routed project's mutations to the default remote instead of its
+// intended destination. See C1b.
+//
+// This check runs once, at daemon startup (see tryStartAutosync); it is not
+// re-evaluated while the daemon is running. Changing routing configuration
+// (`engram cloud route`/`remote`) after `engram serve`/MCP has started will
+// not retroactively block or unblock autosync until the process restarts.
+func autosyncRoutingBlocked(cfg store.Config, s *store.Store) (bool, error) {
+	raw, err := loadCloudConfig(cfg)
+	if err != nil {
+		return false, fmt.Errorf("read cloud config: %w", err)
+	}
+	if raw == nil {
+		raw = &cloudConfig{}
+	}
+	rt := raw.normalizedForRuntime()
+	defaultName := strings.TrimSpace(rt.DefaultRemote)
+
+	enrolled, err := s.ListEnrolledProjects()
+	if err != nil {
+		return false, fmt.Errorf("list enrolled projects: %w", err)
+	}
+	for _, ep := range enrolled {
+		if rt.routeRemote(ep.Project) != defaultName {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func cmdMCP(cfg store.Config) {
